@@ -2,6 +2,7 @@
 
 suppressWarnings(suppressMessages({
   library(glmnet)
+  library(nnet)
 }))
 
 project_root <- getwd()
@@ -26,6 +27,9 @@ train_df <- read.csv(input_file, header = TRUE, stringsAsFactors = FALSE)
 if (!"quality" %in% names(train_df)) {
   stop("Column 'quality' not found in training data.")
 }
+
+train_df$quality <- factor(train_df$quality)
+class_levels <- levels(train_df$quality)
 
 n <- nrow(train_df)
 fold_ids <- sample(rep(seq_len(outer_folds), length.out = n))
@@ -57,10 +61,36 @@ full_squared_interactions_formula <- as.formula(
 results <- data.frame(
   fold = integer(0),
   model = character(0),
-  mse = numeric(0),
+  accuracy = numeric(0),
   tuned_lambda = numeric(0),
   stringsAsFactors = FALSE
 )
+
+get_accuracy <- function(truth, pred) {
+  mean(as.character(truth) == as.character(pred))
+}
+
+fit_predict_multinom <- function(formula_obj, train_data, valid_data) {
+  fit <- multinom(
+    formula_obj,
+    data = train_data,
+    trace = FALSE,
+    MaxNWts = 200000
+  )
+  pred <- predict(fit, newdata = valid_data, type = "class")
+  factor(pred, levels = class_levels)
+}
+
+make_stratified_foldid <- function(y, k) {
+  foldid <- integer(length(y))
+  y_chr <- as.character(y)
+  for (cls in unique(y_chr)) {
+    cls_idx <- which(y_chr == cls)
+    cls_idx <- sample(cls_idx)
+    foldid[cls_idx] <- rep(seq_len(k), length.out = length(cls_idx))
+  }
+  foldid
+}
 
 for (fold in seq_len(outer_folds)) {
   valid_idx <- which(fold_ids == fold)
@@ -70,100 +100,176 @@ for (fold in seq_len(outer_folds)) {
   y_train <- y_all[train_idx]
   x_valid <- x_all[valid_idx, , drop = FALSE]
   y_valid <- y_all[valid_idx]
+  x_train_sq <- x_train^2
+  x_valid_sq <- x_valid^2
+  colnames(x_train_sq) <- paste0(colnames(x_train), "_sq")
+  colnames(x_valid_sq) <- paste0(colnames(x_valid), "_sq")
+  x_train_plus_sq <- cbind(x_train, x_train_sq)
+  x_valid_plus_sq <- cbind(x_valid, x_valid_sq)
 
-  # Intercept-only baseline uses mean response from fold-training split.
-  pred_intercept <- rep(mean(y_train), length(valid_idx))
-  mse_intercept <- mean((y_valid - pred_intercept)^2)
+  # Intercept-only baseline predicts majority class in fold-training split.
+  majority_class <- names(which.max(table(y_train)))
+  pred_intercept <- factor(rep(majority_class, length(valid_idx)), levels = class_levels)
+  acc_intercept <- get_accuracy(y_valid, pred_intercept)
   results <- rbind(
     results,
-    data.frame(fold = fold, model = "intercept", mse = mse_intercept, tuned_lambda = NA_real_)
-  )
-
-  lm_fit <- lm(y_train ~ ., data = as.data.frame(x_train))
-  pred_lm <- predict(lm_fit, newdata = as.data.frame(x_valid))
-  mse_lm <- mean((y_valid - pred_lm)^2)
-  results <- rbind(
-    results,
-    data.frame(fold = fold, model = "all_parameters", mse = mse_lm, tuned_lambda = NA_real_)
+    data.frame(fold = fold, model = "intercept", accuracy = acc_intercept, tuned_lambda = NA_real_)
   )
 
   train_fold_df <- train_df[train_idx, c(feature_cols, "quality"), drop = FALSE]
   valid_fold_df <- train_df[valid_idx, c(feature_cols, "quality"), drop = FALSE]
 
-  squared_fit <- lm(squared_formula, data = train_fold_df)
-  pred_squared <- predict(squared_fit, newdata = valid_fold_df)
-  mse_squared <- mean((y_valid - pred_squared)^2)
+  pred_all <- fit_predict_multinom(quality ~ ., train_fold_df, valid_fold_df)
+  acc_all <- get_accuracy(y_valid, pred_all)
+  results <- rbind(
+    results,
+    data.frame(fold = fold, model = "all_parameters", accuracy = acc_all, tuned_lambda = NA_real_)
+  )
+
+  pred_squared <- fit_predict_multinom(squared_formula, train_fold_df, valid_fold_df)
+  acc_squared <- get_accuracy(y_valid, pred_squared)
   results <- rbind(
     results,
     data.frame(
       fold = fold,
       model = "all_plus_squared",
-      mse = mse_squared,
+      accuracy = acc_squared,
       tuned_lambda = NA_real_
     )
   )
 
-  squared_interactions_fit <- lm(squared_interactions_formula, data = train_fold_df)
-  pred_squared_interactions <- predict(squared_interactions_fit, newdata = valid_fold_df)
-  mse_squared_interactions <- mean((y_valid - pred_squared_interactions)^2)
+  pred_squared_interactions <- fit_predict_multinom(
+    squared_interactions_formula,
+    train_fold_df,
+    valid_fold_df
+  )
+  acc_squared_interactions <- get_accuracy(y_valid, pred_squared_interactions)
   results <- rbind(
     results,
     data.frame(
       fold = fold,
       model = "all_plus_squared_interactions",
-      mse = mse_squared_interactions,
+      accuracy = acc_squared_interactions,
       tuned_lambda = NA_real_
     )
   )
 
-  full_squared_interactions_fit <- lm(full_squared_interactions_formula, data = train_fold_df)
-  pred_full_squared_interactions <- predict(full_squared_interactions_fit, newdata = valid_fold_df)
-  mse_full_squared_interactions <- mean((y_valid - pred_full_squared_interactions)^2)
+  pred_full_squared_interactions <- fit_predict_multinom(
+    full_squared_interactions_formula,
+    train_fold_df,
+    valid_fold_df
+  )
+  acc_full_squared_interactions <- get_accuracy(y_valid, pred_full_squared_interactions)
   results <- rbind(
     results,
     data.frame(
       fold = fold,
       model = "all_plus_squared_plus_interactions_plus_squared_interactions",
-      mse = mse_full_squared_interactions,
+      accuracy = acc_full_squared_interactions,
       tuned_lambda = NA_real_
     )
   )
+
+  min_class_count <- min(table(y_train))
+  inner_folds_current <- min(inner_folds, as.integer(min_class_count))
+  while (inner_folds_current > 2 &&
+    (min_class_count - ceiling(min_class_count / inner_folds_current)) < 2) {
+    inner_folds_current <- inner_folds_current - 1
+  }
+  if (inner_folds_current < 2) {
+    stop("Not enough observations per class to tune lasso/ridge with CV in this fold.")
+  }
+  inner_foldid <- make_stratified_foldid(y_train, inner_folds_current)
 
   set.seed(seed + fold)
   cv_lasso <- cv.glmnet(
     x = x_train,
     y = y_train,
+    family = "multinomial",
     alpha = 1,
-    nfolds = inner_folds,
+    foldid = inner_foldid,
+    type.measure = "class",
     standardize = TRUE
   )
   lambda_lasso <- cv_lasso$lambda.min
-  pred_lasso <- as.numeric(predict(cv_lasso, newx = x_valid, s = "lambda.min"))
-  mse_lasso <- mean((y_valid - pred_lasso)^2)
+  pred_lasso <- as.vector(predict(cv_lasso, newx = x_valid, s = "lambda.min", type = "class"))
+  acc_lasso <- get_accuracy(y_valid, factor(pred_lasso, levels = class_levels))
   results <- rbind(
     results,
-    data.frame(fold = fold, model = "lasso", mse = mse_lasso, tuned_lambda = lambda_lasso)
+    data.frame(fold = fold, model = "lasso", accuracy = acc_lasso, tuned_lambda = lambda_lasso)
+  )
+
+  set.seed(seed + 200 + fold)
+  cv_lasso_plus_sq <- cv.glmnet(
+    x = x_train_plus_sq,
+    y = y_train,
+    family = "multinomial",
+    alpha = 1,
+    foldid = inner_foldid,
+    type.measure = "class",
+    standardize = TRUE
+  )
+  lambda_lasso_plus_sq <- cv_lasso_plus_sq$lambda.min
+  pred_lasso_plus_sq <- as.vector(
+    predict(cv_lasso_plus_sq, newx = x_valid_plus_sq, s = "lambda.min", type = "class")
+  )
+  acc_lasso_plus_sq <- get_accuracy(y_valid, factor(pred_lasso_plus_sq, levels = class_levels))
+  results <- rbind(
+    results,
+    data.frame(
+      fold = fold,
+      model = "lasso_all_plus_squared",
+      accuracy = acc_lasso_plus_sq,
+      tuned_lambda = lambda_lasso_plus_sq
+    )
   )
 
   set.seed(seed + 100 + fold)
   cv_ridge <- cv.glmnet(
     x = x_train,
     y = y_train,
+    family = "multinomial",
     alpha = 0,
-    nfolds = inner_folds,
+    foldid = inner_foldid,
+    type.measure = "class",
     standardize = TRUE
   )
   lambda_ridge <- cv_ridge$lambda.min
-  pred_ridge <- as.numeric(predict(cv_ridge, newx = x_valid, s = "lambda.min"))
-  mse_ridge <- mean((y_valid - pred_ridge)^2)
+  pred_ridge <- as.vector(predict(cv_ridge, newx = x_valid, s = "lambda.min", type = "class"))
+  acc_ridge <- get_accuracy(y_valid, factor(pred_ridge, levels = class_levels))
   results <- rbind(
     results,
-    data.frame(fold = fold, model = "ridge", mse = mse_ridge, tuned_lambda = lambda_ridge)
+    data.frame(fold = fold, model = "ridge", accuracy = acc_ridge, tuned_lambda = lambda_ridge)
+  )
+
+  set.seed(seed + 300 + fold)
+  cv_ridge_plus_sq <- cv.glmnet(
+    x = x_train_plus_sq,
+    y = y_train,
+    family = "multinomial",
+    alpha = 0,
+    foldid = inner_foldid,
+    type.measure = "class",
+    standardize = TRUE
+  )
+  lambda_ridge_plus_sq <- cv_ridge_plus_sq$lambda.min
+  pred_ridge_plus_sq <- as.vector(
+    predict(cv_ridge_plus_sq, newx = x_valid_plus_sq, s = "lambda.min", type = "class")
+  )
+  acc_ridge_plus_sq <- get_accuracy(y_valid, factor(pred_ridge_plus_sq, levels = class_levels))
+  results <- rbind(
+    results,
+    data.frame(
+      fold = fold,
+      model = "ridge_all_plus_squared",
+      accuracy = acc_ridge_plus_sq,
+      tuned_lambda = lambda_ridge_plus_sq
+    )
   )
 }
 
-summary_df <- aggregate(mse ~ model, data = results, FUN = mean)
-names(summary_df)[names(summary_df) == "mse"] <- "avg_mse"
+summary_df <- aggregate(accuracy ~ model, data = results, FUN = mean)
+names(summary_df)[names(summary_df) == "accuracy"] <- "avg_accuracy"
 
 lambda_df <- aggregate(tuned_lambda ~ model, data = results, FUN = function(v) {
   mean(v, na.rm = TRUE)
