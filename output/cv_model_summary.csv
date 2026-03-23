@@ -1,0 +1,8 @@
+"model","avg_mse","avg_tuned_lambda"
+"lasso",0.539313415812077,0.00093625393460148
+"ridge",0.541163335409889,0.0390062732136104
+"all_parameters",0.539270775694484,NA
+"all_plus_squared",0.525965914559537,NA
+"all_plus_squared_interactions",0.502819675887576,NA
+"all_plus_squared_plus_interactions_plus_squared_interactions",1.04959816767505,NA
+"intercept",0.769410686822327,NA
