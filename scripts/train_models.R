@@ -3,6 +3,14 @@
 suppressWarnings(suppressMessages({
   library(glmnet)
   library(nnet)
+  if (!requireNamespace("randomForest", quietly = TRUE)) {
+    stop(
+      "Package 'randomForest' is required but not installed.\n",
+      "Install it with:\n",
+      "  install.packages('randomForest')\n"
+    )
+  }
+  library(randomForest)
 }))
 
 project_root <- getwd()
@@ -68,6 +76,14 @@ results <- data.frame(
 
 get_accuracy <- function(truth, pred) {
   mean(as.character(truth) == as.character(pred))
+}
+
+add_squared_columns <- function(df, feature_names) {
+  out <- df
+  for (nm in feature_names) {
+    out[[paste0(nm, "_sq")]] <- out[[nm]]^2
+  }
+  out
 }
 
 fit_predict_multinom <- function(formula_obj, train_data, valid_data) {
@@ -166,6 +182,38 @@ for (fold in seq_len(outer_folds)) {
       fold = fold,
       model = "all_plus_squared_plus_interactions_plus_squared_interactions",
       accuracy = acc_full_squared_interactions,
+      tuned_lambda = NA_real_
+    )
+  )
+
+  set.seed(seed + 400 + fold)
+  rf_fit <- randomForest(quality ~ ., data = train_fold_df)
+  rf_pred <- predict(rf_fit, newdata = valid_fold_df, type = "class")
+  rf_pred <- factor(rf_pred, levels = class_levels)
+  acc_rf <- get_accuracy(y_valid, rf_pred)
+  results <- rbind(
+    results,
+    data.frame(
+      fold = fold,
+      model = "random_forest",
+      accuracy = acc_rf,
+      tuned_lambda = NA_real_
+    )
+  )
+
+  set.seed(seed + 500 + fold)
+  train_fold_sq <- add_squared_columns(train_fold_df, feature_cols)
+  valid_fold_sq <- add_squared_columns(valid_fold_df, feature_cols)
+  rf_sq_fit <- randomForest(quality ~ ., data = train_fold_sq)
+  rf_sq_pred <- predict(rf_sq_fit, newdata = valid_fold_sq, type = "class")
+  rf_sq_pred <- factor(rf_sq_pred, levels = class_levels)
+  acc_rf_sq <- get_accuracy(y_valid, rf_sq_pred)
+  results <- rbind(
+    results,
+    data.frame(
+      fold = fold,
+      model = "random_forest_all_plus_squared",
+      accuracy = acc_rf_sq,
       tuned_lambda = NA_real_
     )
   )
